@@ -1,0 +1,108 @@
+{
+  "type": "knapsack",
+  "num_items": 20,
+  "weight_capacity": 500,
+  "items": [
+    {
+      "id": 0,
+      "value": 91,
+      "weight": 8
+    },
+    {
+      "id": 1,
+      "value": 24,
+      "weight": 76
+    },
+    {
+      "id": 2,
+      "value": 13,
+      "weight": 30
+    },
+    {
+      "id": 3,
+      "value": 45,
+      "weight": 96
+    },
+    {
+      "id": 4,
+      "value": 41,
+      "weight": 88
+    },
+    {
+      "id": 5,
+      "value": 38,
+      "weight": 94
+    },
+    {
+      "id": 6,
+      "value": 27,
+      "weight": 74
+    },
+    {
+      "id": 7,
+      "value": 23,
+      "weight": 58
+    },
+    {
+      "id": 8,
+      "value": 96,
+      "weight": 33
+    },
+    {
+      "id": 9,
+      "value": 79,
+      "weight": 62
+    },
+    {
+      "id": 10,
+      "value": 21,
+      "weight": 80
+    },
+    {
+      "id": 11,
+      "value": 85,
+      "weight": 40
+    },
+    {
+      "id": 12,
+      "value": 64,
+      "weight": 5
+    },
+    {
+      "id": 13,
+      "value": 14,
+      "weight": 25
+    },
+    {
+      "id": 14,
+      "value": 13,
+      "weight": 94
+    },
+    {
+      "id": 15,
+      "value": 21,
+      "weight": 59
+    },
+    {
+      "id": 16,
+      "value": 37,
+      "weight": 48
+    },
+    {
+      "id": 17,
+      "value": 39,
+      "weight": 40
+    },
+    {
+      "id": 18,
+      "value": 74,
+      "weight": 24
+    },
+    {
+      "id": 19,
+      "value": 87,
+      "weight": 32
+    }
+  ],
+  "description": "\n# Knapsack Problem\n\n## Overview\nThis is a 0-1 knapsack problem where you need to select items to maximize total value while respecting a weight constraint.\n\n## Problem Details\n- Number of items: 20\n- Weight capacity: 500\n- Total value of all items: 932\n- Total weight of all items: 1066 (exceeds capacity by 566 units)\n- Average item value: 46.60\n- Average item weight: 53.30\n\n## Top Items by Value-to-Weight Ratio\n- Item 12 (variable x_12): Value = 64, Weight = 5, Ratio = 12.80\n- Item 0 (variable x_0): Value = 91, Weight = 8, Ratio = 11.38\n- Item 18 (variable x_18): Value = 74, Weight = 24, Ratio = 3.08\n- Item 8 (variable x_8): Value = 96, Weight = 33, Ratio = 2.91\n- Item 19 (variable x_19): Value = 87, Weight = 32, Ratio = 2.72\n\n## Optimization Goal\nChoose a subset of the 20 items to include in the knapsack such that:\n1. The total weight does not exceed 500\n2. The total value is maximized\n\n## Decision Variables\n- x_i (binary): 1 if item i is selected, 0 otherwise\n\n## Constraints\n- Sum of weights of selected items \u2264 500\n\n## Objective\n- Maximize the sum of values of selected items\n"
+}
