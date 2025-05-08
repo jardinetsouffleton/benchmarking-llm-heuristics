@@ -7,6 +7,7 @@ from datetime import datetime
 from constraint import Problem, RecursiveBacktrackingSolver, AllDifferentConstraint
 from heuristic import AdvancedHeuristicSolver
 from graph_instance_generator import GraphProblemGenerator
+import concurrent.futures  # Added for parallel execution
 
 # Setup logging
 logging.basicConfig(
@@ -373,23 +374,229 @@ def compare_solvers(llm_result, classical_result, problem_type):
         "classical_solutions_count": classical_result.get("solutions_found", 0)
     }
 
+def run_single_experiment_wrapper(task_args):
+    """
+    Wrapper function to run a single experiment instance.
+    This function is designed to be called by the ProcessPoolExecutor.
+    """
+    problem_type, nodes, density, instance_num, problem_dir, \
+    time_limit, node_limit, seed, batch_total_instances, current_instance_idx = task_args
+
+    try:
+        # Each worker should have its own generator, seeded appropriately for reproducibility
+        instance_seed = seed + instance_num if seed is not None else None
+        generator = GraphProblemGenerator(seed=instance_seed)
+        
+        instance_id = f"{problem_type}_{instance_num+1}"
+
+        if problem_type == "maxcut":
+            problem = generator.generate_maxcut(num_nodes=nodes, edge_probability=density)
+        elif problem_type == "mis":
+            problem = generator.generate_mis(num_nodes=nodes, edge_probability=density)
+        elif problem_type == "mvc":
+            problem = generator.generate_mvc(num_nodes=nodes, edge_probability=density)
+        elif problem_type == "graph_coloring":
+            problem = generator.generate_graph_coloring(num_nodes=nodes, edge_probability=density)
+        else:
+            raise ValueError(f"Unknown problem type in worker: {problem_type}")
+
+        instance_file = os.path.join(problem_dir, f"instance_{instance_num+1}.json")
+        generator.save_instance(problem, instance_file)
+        
+        # Run the experiment
+        experiment_result = run_experiment(
+            problem, 
+            time_limit=time_limit, 
+            node_limit=node_limit, 
+            output_dir=problem_dir
+        )
+        
+        return {
+            "status": "success",
+            "instance_id": instance_id,
+            "problem_type": problem_type,
+            "nodes": nodes,
+            "num_edges": problem["num_edges"],
+            "experiment_result": experiment_result,
+            "current_instance_idx": current_instance_idx
+        }
+    except Exception as e:
+        logger.error(f"Error in worker for {problem_type} instance {instance_num+1}: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "instance_id": f"{problem_type}_{instance_num+1}",
+            "problem_type": problem_type,
+            "error": str(e),
+            "current_instance_idx": current_instance_idx
+        }
+
+def run_batch_experiments(problem_types=None, nodes=10, density=0.3, instances_per_type=25, 
+                        output_dir="results", node_limit=100, time_limit=1800, seed=None,
+                        num_workers=1):  # Added num_workers
+    """Run a batch of experiments across multiple problem types, potentially in parallel."""
+    if problem_types is None:
+        problem_types = ["maxcut", "mis", "mvc", "graph_coloring"]
+        
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    batch_dir = os.path.join(output_dir, f"batch_{timestamp}")
+    os.makedirs(batch_dir, exist_ok=True)
+    
+    config = {
+        "timestamp": timestamp, "problem_types": problem_types, "nodes": nodes, "density": density,
+        "instances_per_type": instances_per_type, "total_instances": len(problem_types) * instances_per_type,
+        "node_limit": node_limit, "time_limit": time_limit, "seed": seed, "num_workers": num_workers
+    }
+    with open(os.path.join(batch_dir, "batch_config.json"), 'w') as f:
+        json.dump(config, f, indent=2)
+    
+    batch_stats = {
+        "total_instances": len(problem_types) * instances_per_type, "completed_instances": 0,
+        "successful_instances": 0, 
+        "problem_stats": {p: {"count": 0, "success_llm": 0, "success_classical": 0, "errors": 0} for p in problem_types},
+        "start_time": time.time(), "results": []
+    }
+
+    tasks = []
+    overall_instance_idx = 0
+    for problem_type in problem_types:
+        problem_dir = os.path.join(batch_dir, problem_type)
+        os.makedirs(problem_dir, exist_ok=True)
+        for i in range(instances_per_type):
+            overall_instance_idx += 1
+            task_args = (
+                problem_type, nodes, density, i, problem_dir,
+                time_limit, node_limit, seed, 
+                batch_stats["total_instances"], overall_instance_idx
+            )
+            tasks.append(task_args)
+
+    processed_results = []  # To store results in order for logging if desired
+    
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        future_to_task_idx = {executor.submit(run_single_experiment_wrapper, task): task[8] for task in tasks}
+        
+        for future in concurrent.futures.as_completed(future_to_task_idx):
+            original_idx = future_to_task_idx[future]
+            try:
+                worker_result = future.result()
+                worker_result["original_idx"] = original_idx  # Keep track for ordered logging
+                processed_results.append(worker_result)
+            except Exception as exc:
+                logger.error(f"Task (original_idx {original_idx}) generated an exception: {exc}", exc_info=True)
+                processed_results.append({
+                    "status": "error", 
+                    "error": str(exc), 
+                    "original_idx": original_idx,
+                    "problem_type": "unknown_due_to_future_error" 
+                })
+    
+    processed_results.sort(key=lambda r: r.get("original_idx", float('inf')))
+
+    for worker_result in processed_results:
+        batch_stats["completed_instances"] += 1
+        problem_type = worker_result.get("problem_type", "unknown")
+
+        if problem_type != "unknown" and problem_type not in batch_stats["problem_stats"]:
+             batch_stats["problem_stats"][problem_type] = {"count": 0, "success_llm": 0, "success_classical": 0, "errors": 0}
+
+        if worker_result["status"] == "success":
+            experiment_result = worker_result["experiment_result"]
+            instance_id = worker_result["instance_id"]
+            
+            logger.info(f"Completed instance {instance_id} [Overall: {worker_result['current_instance_idx']}/{batch_stats['total_instances']}]")
+
+            if problem_type != "unknown":
+                batch_stats["problem_stats"][problem_type]["count"] += 1
+                if experiment_result["llm_solver"]["success"]:
+                    batch_stats["problem_stats"][problem_type]["success_llm"] += 1
+                if experiment_result["classical_solver"]["success"]:
+                    batch_stats["problem_stats"][problem_type]["success_classical"] += 1
+                if experiment_result["llm_solver"]["success"] or experiment_result["classical_solver"]["success"]:
+                    batch_stats["successful_instances"] += 1
+            
+            result_summary = {
+                "instance_id": instance_id, "problem_type": problem_type,
+                "num_nodes": worker_result["nodes"], "num_edges": worker_result["num_edges"],
+                "llm_success": experiment_result["llm_solver"]["success"],
+                "llm_time": experiment_result["llm_solver"]["solve_time"],
+                "classical_success": experiment_result["classical_solver"]["success"],
+                "classical_time": experiment_result["classical_solver"]["solve_time"],
+                "comparative": experiment_result.get("comparative_analysis")
+            }
+            batch_stats["results"].append(result_summary)
+        else:
+            instance_id = worker_result.get("instance_id", f"unknown_instance_{worker_result['original_idx']}")
+            logger.error(f"Failed instance {instance_id} [Overall: {worker_result.get('current_instance_idx', worker_result['original_idx'])}/{batch_stats['total_instances']}]. Error: {worker_result['error']}")
+            if problem_type != "unknown":
+                 batch_stats["problem_stats"][problem_type]["count"] += 1
+                 batch_stats["problem_stats"][problem_type]["errors"] += 1
+            batch_stats["results"].append({
+                "instance_id": instance_id, "problem_type": problem_type, "status": "error", "error_message": worker_result['error']
+            })
+
+        if batch_stats["completed_instances"] > 0:
+            batch_stats["elapsed_time"] = time.time() - batch_stats["start_time"]
+            avg_time_per_instance = batch_stats["elapsed_time"] / batch_stats["completed_instances"]
+            remaining_instances = batch_stats["total_instances"] - batch_stats["completed_instances"]
+            est_remaining_time = avg_time_per_instance * remaining_instances
+            logger.info(f"Progress: {batch_stats['completed_instances']}/{batch_stats['total_instances']} instances processed.")
+            logger.info(f"Estimated time remaining: {est_remaining_time/60:.1f} minutes.")
+            
+            with open(os.path.join(batch_dir, "batch_stats.json"), 'w') as f:
+                json.dump(batch_stats, f, indent=2)
+    
+    total_time = time.time() - batch_stats["start_time"]
+    avg_time_val = (total_time / batch_stats["total_instances"]) if batch_stats["total_instances"] > 0 else 0
+    success_llm_val = (sum(stats["success_llm"] for stats in batch_stats["problem_stats"].values()) / batch_stats["total_instances"]) if batch_stats["total_instances"] > 0 else 0
+    success_classical_val = (sum(stats["success_classical"] for stats in batch_stats["problem_stats"].values()) / batch_stats["total_instances"]) if batch_stats["total_instances"] > 0 else 0
+    
+    summary = {
+        "batch_id": timestamp, "total_instances": batch_stats["total_instances"],
+        "successful_instances": batch_stats["successful_instances"],
+        "total_time_hours": total_time / 3600,
+        "average_time_per_instance": avg_time_val,
+        "problem_stats": batch_stats["problem_stats"],
+        "success_rate_llm": success_llm_val,
+        "success_rate_classical": success_classical_val
+    }
+    
+    with open(os.path.join(batch_dir, "batch_summary.json"), 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    logger.info(f"Batch experiments completed. Total time: {total_time/3600:.2f} hours")
+    logger.info(f"Results saved to {batch_dir}")
+    
+    return batch_stats
+
 def main():
     parser = argparse.ArgumentParser(description="Run CSP experiments with LLM heuristics")
-    parser.add_argument("--problem", type=str, choices=["maxcut", "mis", "mvc", "graph_coloring"], default="maxcut",
-                         help="Problem type to solve")
+    parser.add_argument("--problem", type=str, choices=["maxcut", "mis", "mvc", "graph_coloring", "all"], default="maxcut",
+                         help="Problem type to solve (use 'all' for batch mode)")
     parser.add_argument("--nodes", type=int, default=10, help="Number of nodes in the graph")
     parser.add_argument("--density", type=float, default=0.3, help="Edge density")
-    parser.add_argument("--instances", type=int, default=1, help="Number of instances to generate and solve")
+    parser.add_argument("--instances", type=int, default=1, help="Number of instances to generate per problem type")
     parser.add_argument("--output", type=str, default="results", help="Output directory for results")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed")
-    parser.add_argument("--node-limit", type=int, default=100, help="Maximum number of nodes to explore")
-    parser.add_argument("--time-limit", type=int, default=1800, help="Time limit in seconds")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--node-limit", type=int, default=100, help="Maximum number of nodes to explore in search")
+    parser.add_argument("--time-limit", type=int, default=1800, help="Time limit in seconds per instance")
+    parser.add_argument("--batch", action="store_true", help="Run in batch mode across all problem types")
+    parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers for batch mode")  # Added workers
     args = parser.parse_args()
     
-    # Initialize the generator
+    os.makedirs(args.output, exist_ok=True)
+    
+    if args.batch or args.problem == "all":
+        problem_types = ["maxcut", "mis", "mvc", "graph_coloring"]
+        run_batch_experiments(
+            problem_types=problem_types, nodes=args.nodes, density=args.density,
+            instances_per_type=args.instances, output_dir=args.output,
+            node_limit=args.node_limit, time_limit=args.time_limit, seed=args.seed,
+            num_workers=args.workers  # Pass num_workers
+        )
+        return
+    
     generator = GraphProblemGenerator(seed=args.seed)
     
-    # Generate and solve instances
     for i in range(args.instances):
         logger.info(f"Generating instance {i+1}/{args.instances} of {args.problem}")
         
@@ -405,12 +612,10 @@ def main():
             logger.error(f"Invalid problem type: {args.problem}")
             return
         
-        # Save the problem instance
         instance_file = os.path.join(args.output, f"{args.problem}_instance_{i+1}.json")
         os.makedirs(args.output, exist_ok=True)
         generator.save_instance(problem, instance_file)
         
-        # Run the experiment with both solvers
         run_experiment(problem, time_limit=args.time_limit, node_limit=args.node_limit, output_dir=args.output)
 
 if __name__ == "__main__":
