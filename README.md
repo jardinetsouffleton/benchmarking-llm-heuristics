@@ -26,6 +26,30 @@ cd benchmarking-llm-heuristics
 pip install -r requirements.txt
 ```
 
+## Running Tests
+
+The project uses a mock LLM system for testing to avoid requiring an actual LLM service during tests:
+
+```bash
+# Run tests with coverage report
+pytest tests/ --cov=.
+
+# Run a specific test file
+pytest tests/test_heuristic.py
+
+# Run a specific test method
+pytest tests/test_heuristic.py::TestAdvancedHeuristicSolver::test_variable_selection
+```
+
+## GitHub Actions
+
+This repository is configured with GitHub Actions to automatically run tests on push to main branch or when creating a pull request. The workflow:
+
+1. Sets up Python
+2. Installs dependencies
+3. Runs tests with coverage reporting
+4. Uploads coverage to Codecov (if configured)
+
 ## Usage
 
 Run experiments on various graph problems:
@@ -40,29 +64,7 @@ Available problem types:
 - `mvc`: Minimum Vertex Cover
 - `graph_coloring`: Graph Coloring Problem
 
-Additional parameters:
-- `--nodes`: Number of nodes in the graph
-- `--density`: Edge density
-- `--instances`: Number of instances to generate and solve
-- `--node-limit`: Maximum number of nodes to explore (default: 100)
-- `--time-limit`: Maximum solving time in seconds (default: 1800)
+## License
 
-## Components
-
-- `heuristic.py`: LLM-enhanced CSP solver implementation
-- `run_experiments.py`: Experiment execution and evaluation
-- `graph_instance_generator.py`: Problem instance generation
-
-## Results
-
-Experiment results are saved in the `results/` directory as JSON files containing:
-- Problem details
-- Solver performance metrics
-- LLM vs. classical solver comparison
-- Statistics on LLM guidance quality
-- Infeasibility explanations (when detected)
-
-## Citation
-
-If you use this code in your research, please cite:
+This project is licensed under the MIT License - see the LICENSE file for details.
 

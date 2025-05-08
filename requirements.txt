@@ -2,3 +2,5 @@ numpy
 python-constraint
 requests
 networkx
+pytest
+pytest-cov
