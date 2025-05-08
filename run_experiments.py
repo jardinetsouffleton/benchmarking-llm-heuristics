@@ -24,13 +24,21 @@ def setup_csp_from_graph_problem(problem, node_limit=10000):
     """Convert a graph problem to a CSP."""
     csp = Problem(solver=AdvancedHeuristicSolver(log_level=logging.INFO, node_limit=node_limit))
     
+    # Dictionary to hold textual constraint descriptions
+    constraint_descriptions = {}
+    
+    # Pass problem instance to the solver for context
+    if hasattr(csp._solver, 'set_problem_instance'):
+        csp._solver.set_problem_instance(problem)
+    
     if problem["type"] == "maxcut":
         # MaxCut: Binary variable for each node
         for node in range(problem["num_nodes"]):
             csp.addVariable(f"node_{node}", [0, 1])  # 0=Set 0, 1=Set 1
         
-        # No constraints, but we'll add an objective function
-        # (handled externally since python-constraint doesn't support optimization)
+        # No constraints, but add constraint descriptions for the objective
+        for u, v, weight in problem["edges"]:
+            constraint_descriptions[(f"node_{u}", f"node_{v}")] = f"Edge weight {weight}: nodes in different partitions contribute to cut value"
         
     elif problem["type"] == "mis":
         # MIS: Binary variable for each node
@@ -41,6 +49,7 @@ def setup_csp_from_graph_problem(problem, node_limit=10000):
         for u, v in problem["edges"]:
             csp.addConstraint(lambda a, b: not (a == 1 and b == 1), 
                             (f"node_{u}", f"node_{v}"))
+            constraint_descriptions[(f"node_{u}", f"node_{v}")] = f"Nodes {u} and {v} cannot both be in the independent set (connected by edge)"
             
     elif problem["type"] == "mvc":
         # MVC: Binary variable for each node
@@ -51,6 +60,7 @@ def setup_csp_from_graph_problem(problem, node_limit=10000):
         for u, v in problem["edges"]:
             csp.addConstraint(lambda a, b: a == 1 or b == 1, 
                             (f"node_{u}", f"node_{v}"))
+            constraint_descriptions[(f"node_{u}", f"node_{v}")] = f"At least one of nodes {u} or {v} must be in the vertex cover to cover edge ({u},{v})"
             
     elif problem["type"] == "graph_coloring":
         # Graph Coloring: Color variable for each node
@@ -62,6 +72,11 @@ def setup_csp_from_graph_problem(problem, node_limit=10000):
         for u, v in problem["edges"]:
             csp.addConstraint(lambda a, b: a != b, 
                             (f"node_{u}", f"node_{v}"))
+            constraint_descriptions[(f"node_{u}", f"node_{v}")] = f"Adjacent nodes {u} and {v} must have different colors"
+    
+    # Set the constraint descriptions in the solver
+    if hasattr(csp._solver, 'set_constraint_descriptions'):
+        csp._solver.set_constraint_descriptions(constraint_descriptions)
             
     return csp
 

@@ -19,6 +19,10 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
         self.llm_temperature = 0.3
         self.max_llm_retries = max_llm_retries
         
+        # Store problem instance information
+        self.problem_instance = None
+        self.constraint_descriptions = None
+        
         # Performance tracking and limits
         self.node_limit = node_limit
         self.nodes_explored = 0
@@ -31,8 +35,7 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
             "llm_call_times": [],
             "variable_selections": [],
             "value_orderings": [],
-            "infeasible_detected": False,
-            "infeasibility_explanation": None  # Added field for explanation
+            "fixpoint_iterations": 0,
         }
         
         # Setup logging
@@ -44,6 +47,30 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
     
+    def set_problem_instance(self, problem_instance):
+        """Set the complete problem instance data.
+        
+        Args:
+            problem_instance: A dictionary containing all problem information
+                              including problem type, description, constraints, etc.
+        """
+        self.problem_instance = problem_instance
+        self.logger.info(f"Set problem instance of type: {problem_instance.get('type', 'unknown')}")
+        
+        # Extract constraint descriptions from problem instance if available
+        if 'description' in problem_instance:
+            self.logger.info("Problem instance includes detailed description")
+    
+    def set_constraint_descriptions(self, constraint_descriptions):
+        """Set human-readable descriptions for constraints.
+        
+        Args:
+            constraint_descriptions: A dictionary mapping constraints to human-readable descriptions.
+                                     Format: {(var1, var2): "description"} or {vars_tuple: "description"}
+        """
+        self.constraint_descriptions = constraint_descriptions
+        self.logger.info("Set constraint descriptions for better LLM understanding")
+
     def getSolutions(self, domains, constraints, vconstraints):
         # Reset stats for this solving session
         self.nodes_explored = 0
@@ -56,8 +83,7 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
             "llm_call_times": [],
             "variable_selections": [],
             "value_orderings": [],
-            "infeasible_detected": False,
-            "infeasibility_explanation": None  # Reset explanation
+            "fixpoint_iterations": 0,
         }
         
         all_solutions = []
@@ -95,6 +121,30 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
             assignments[variable] = random.choice(domain)
         return assignments
     
+    def _enforce_fixpoint(self, domains, vconstraints, assignments):
+        """Prune domains until no further values can be removed."""
+        iterations = 0
+        changed = True
+        while changed:
+            changed = False
+            for var, domain in domains.items():
+                if var in assignments:
+                    continue
+                to_remove = []
+                for val in list(domain):
+                    assignments[var] = val
+                    for constraint, vars in vconstraints.get(var, []):
+                        if not constraint(vars, domains, assignments, None):
+                            to_remove.append(val)
+                            break
+                    assignments.pop(var, None)
+                if to_remove:
+                    for v in to_remove:
+                        domain.remove(v)
+                    changed = True
+            iterations += 1
+        self.solving_stats["fixpoint_iterations"] += iterations
+
     def recursiveBacktracking(self, solutions, domains, vconstraints, assignments, single):
         """Customize the recursive backtracking algorithm."""
         # Check if we've reached the node limit
@@ -103,15 +153,10 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
             self.logger.warning(f"Node limit reached: {self.node_limit}")
             return solutions
             
+        # Apply fixpoint-based domain pruning before picking next variable
+        self._enforce_fixpoint(domains, vconstraints, assignments)
         variable = self.select_next_variable(domains, vconstraints, assignments)
         
-        # Handle infeasibility detection from LLM
-        if isinstance(variable, tuple) and variable[0] == "INFEASIBLE":
-            self.logger.info("LLM detected infeasibility, stopping search")
-            self.solving_stats["infeasible_detected"] = True
-            self.solving_stats["infeasibility_explanation"] = variable[1]  # Store the explanation
-            return solutions
-            
         if variable is None:
             # No unassigned variables. We've got a solution.
             solutions.append(assignments.copy())
@@ -171,11 +216,6 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
         self.logger.info(f"Querying LLM for next variable among {unassigned}")
         llm_choice = self.query_next_variable(unassigned, domains, vconstraints, assignments)
         
-        # Handle tuple return for infeasibility case
-        if isinstance(llm_choice, tuple) and llm_choice[0] == "INFEASIBLE":
-            self.logger.info(f"LLM declared problem infeasible: {llm_choice[1][:100]}...")
-            return llm_choice
-            
         if llm_choice in unassigned:
             self.logger.info(f"LLM selected variable: {llm_choice}")
             return llm_choice
@@ -234,9 +274,10 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
                 current_prompt = user_prompt
                 if error_msg and attempts > 0:
                     current_prompt = (
-                        f"{user_prompt}\n\n"
+                        
                         f"Your previous response caused this error:\n{error_msg}\n"
-                        "Please try again with a corrected answer."
+                        "Please try again with a corrected answer." +
+                        f"{user_prompt}\n\n"
                     )
                 
                 # Call LLM
@@ -266,22 +307,87 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
         self.logger.warning(f"No tagged answer found in: {text[:100]}...")
         return text.strip()  # Return whole text if no tags found
 
-    def query_next_variable(self, unassigned, domains, vconstraints, assignments):
+    def query_next_variable(self, unassigned, domains, vconstraints, assignments, constraint_descriptions=None):
         """Query the local vllm instance for which variable to pick next.
         
         This function asks the LLM to select the next variable to assign from the 
         unassigned variables. It's the variable selection heuristic.
+        
+        Args:
+            unassigned: List of unassigned variables
+            domains: Dictionary of domains for each variable
+            vconstraints: Dictionary of constraints for each variable
+            assignments: Current variable assignments
+            constraint_descriptions: Optional dictionary mapping constraint to readable description
+                                     Format: {(var1, var2): "description"} or {vars_tuple: "description"}
         """
+        # If explicit constraint_descriptions are provided, use them; 
+        # otherwise fall back to stored descriptions
+        descriptions_to_use = constraint_descriptions or self.constraint_descriptions
+        
+        # Build constraint information, using descriptions if provided
+        constraint_info = []
+        
+        if descriptions_to_use:
+            # Use the provided human-readable constraint descriptions
+            for vars_tuple, description in descriptions_to_use.items():
+                if any(v in unassigned for v in vars_tuple):
+                    constraint_info.append(f"{' and '.join(vars_tuple)}: {description}")
+        else:
+            # Fall back to generic constraint representation
+            for var, clist in vconstraints.items():
+                for _, vars in clist:
+                    if isinstance(vars, (list, tuple)) and len(vars) >= 2:
+                        constraint_info.append(f"Constraint between {' and '.join(vars)}")
+        
+        # Add constraints that affect unassigned variables
+        relevant_constraints = [c for c in constraint_info if any(v in c for v in unassigned)]
+        constraint_str = "\n- ".join([""] + sorted(set(relevant_constraints))) if relevant_constraints else "None"
+
+        # Add objective function information based on problem type
+        objective_str = ""
+        if self.problem_instance:
+            problem_type = self.problem_instance.get('type', 'general')
+            if problem_type == "maxcut":
+                objective_str = "Objective: MAXIMIZE the sum of weights of edges crossing the cut (edges with endpoints in different partitions)."
+            elif problem_type == "mis":
+                objective_str = "Objective: MAXIMIZE the number of nodes in the independent set."
+            elif problem_type == "mvc":
+                objective_str = "Objective: MINIMIZE the number of nodes in the vertex cover."
+            elif problem_type == "graph_coloring":
+                objective_str = "Objective: MINIMIZE the number of colors used while ensuring adjacent nodes have different colors."
+
+        # Build the prompt, including problem instance information if available
         prompt = (
             f"Unassigned variables: {unassigned}\n"
-            f"Domains of unassigned variables: { {var: domains[var] for var in unassigned} }\n"
+            f"Domains of unassigned variables: {domains}\n"
             f"Current assignments: {assignments}\n"
-            f"Constraints on each var: { {k:len(vconstraints.get(k,[])) for k in domains} }\n\n"
-            "You are selecting the next variable to be assigned in a constraint satisfaction problem.\n"
+            f"Constraints:{constraint_str}\n"
+        )
+        
+        # Add problem type and description if available
+        if self.problem_instance:
+            problem_type = self.problem_instance.get('type', 'general')
+            prompt += f"\nProblem type: {problem_type}\n"
+            if objective_str:
+                prompt += f"{objective_str}\n"
+            
+            # Add relevant part of problem description if available
+            if 'description' in self.problem_instance:
+                # Extract just the overview and problem details sections to keep prompt manageable
+                desc = self.problem_instance['description']
+                overview_match = re.search(r'## Overview(.*?)##', desc, re.DOTALL)
+                details_match = re.search(r'## Problem Details(.*?)##', desc, re.DOTALL)
+                
+                if overview_match:
+                    prompt += f"Problem overview: {overview_match.group(1).strip()}\n"
+                if details_match:
+                    prompt += f"Problem details: {details_match.group(1).strip()}\n"
+        
+        prompt += (
+            "\nYou are selecting the next variable to be assigned in a constraint satisfaction problem.\n"
             "Which of the unassigned variables should be selected next?\n\n"
-            "If you believe this problem is infeasible based on the current assignments, reply with <answer>INFEASIBLE</answer> "
-            "and then provide a detailed explanation of why you believe it's infeasible.\n"
-            "Otherwise, provide ONLY the variable name between <answer> tags.\n"
+            "Provide ONLY the variable name between <answer> tags.\n"
             "Example: <answer>A</answer>"
         )
         
@@ -290,18 +396,6 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
         def parse_and_validate(content):
             var_name = self._extract_tagged_answer(content)
             
-            # Check for infeasibility
-            if var_name == "INFEASIBLE":
-                # Extract the explanation from the content after the INFEASIBLE tag
-                full_content = content.strip()
-                explanation = full_content.split("</answer>", 1)
-                if len(explanation) > 1:
-                    explanation_text = explanation[1].strip()
-                else:
-                    explanation_text = "No explanation provided"
-                
-                return ("INFEASIBLE", explanation_text)
-                
             if var_name not in unassigned:
                 raise ValueError(f"Variable '{var_name}' is not in the unassigned list: {unassigned}")
                 
@@ -323,14 +417,74 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
         that was selected by the previous call to select_next_variable. The result is
         used to determine the order in which values are tried for this variable only.
         """
+        # Add objective function information based on problem type
+        objective_str = ""
+        if self.problem_instance:
+            problem_type = self.problem_instance.get('type', 'general')
+            if problem_type == "maxcut":
+                objective_str = "Objective: MAXIMIZE the sum of weights of edges crossing the cut (edges with endpoints in different partitions)."
+            elif problem_type == "mis":
+                objective_str = "Objective: MAXIMIZE the number of nodes in the independent set."
+            elif problem_type == "mvc":
+                objective_str = "Objective: MINIMIZE the number of nodes in the vertex cover."
+            elif problem_type == "graph_coloring":
+                objective_str = "Objective: MINIMIZE the number of colors used while ensuring adjacent nodes have different colors."
+
+        # Build constraint information, including all constraints
+        constraint_str = ""
+        if self.constraint_descriptions:
+            # Include all constraints, not just those relevant to the current variable
+            all_constraints = []
+            for vars_tuple, description in self.constraint_descriptions.items():
+                all_constraints.append(f"{' and '.join(vars_tuple)}: {description}")
+            
+            if all_constraints:
+                constraint_str = "\n- ".join(["All constraints:"] + all_constraints)
+            else:
+                constraint_str = "No constraints specified."
+        else:
+            # If no constraint descriptions, use generic representation from vconstraints
+            all_constraints = []
+            for var, clist in vconstraints.items():
+                for _, vars in clist:
+                    if isinstance(vars, (list, tuple)) and len(vars) >= 2:
+                        constraint_desc = f"Constraint between {' and '.join(vars)}"
+                        if constraint_desc not in all_constraints:
+                            all_constraints.append(constraint_desc)
+            
+            if all_constraints:
+                constraint_str = "\n- ".join(["All constraints:"] + all_constraints)
+            else:
+                constraint_str = "No constraints identified."
+
+        # Highlight which constraints directly involve the current variable
+        if self.constraint_descriptions:
+            relevant_constraints = []
+            for vars_tuple, description in self.constraint_descriptions.items():
+                if variable in vars_tuple:
+                    relevant_constraints.append(f"{' and '.join(vars_tuple)}: {description}")
+            
+            if relevant_constraints:
+                constraint_str += "\n\nConstraints involving the current variable:\n- "
+                constraint_str += "\n- ".join(relevant_constraints)
+
         prompt = (
             f"Variable to assign: {variable}\n"
             f"Domain values for this variable: {values}\n"
             f"Domains of all variables: {domains}\n"
             f"Current assignments: {assignments}\n"
-            f"Constraints on this variable: {len(vconstraints.get(variable, []))}\n"
-            f"Constraints details: {vconstraints.get(variable, [])}\n\n"
-            f"You are deciding the order to try values for variable '{variable}'.\n"
+            f"{constraint_str}\n"
+        )
+        
+        # Add problem type and objective
+        if self.problem_instance:
+            problem_type = self.problem_instance.get('type', 'general')
+            prompt += f"\nProblem type: {problem_type}\n"
+            if objective_str:
+                prompt += f"{objective_str}\n"
+        
+        prompt += (
+            f"\nYou are deciding the order to try values for variable '{variable}'.\n"
             "Return an array with the values in the order you recommend trying them.\n\n"
             "If you believe we should backtrack from this variable because no value will lead to a solution, "
             "reply with <answer>BACKTRACK</answer> instead.\n\n"
