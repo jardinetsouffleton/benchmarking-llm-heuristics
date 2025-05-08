@@ -200,6 +200,15 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
             if "BACKTRACK" in str(e):
                 self.backtrack_count += 1
                 self.logger.info(f"Backtracking from variable {variable} as suggested by LLM")
+                # Log LLM-suggested backtrack
+                if self.decision_history and self.decision_history[-1]['variable'] == variable:
+                    self.decision_history[-1]['action'] = 'backtrack_llm_suggested'
+                else:
+                    self.decision_history.append({
+                        'variable': variable,
+                        'assignments_at_decision': assignments.copy(),
+                        'action': 'backtrack_llm_suggested'
+                    })
                 return solutions
             raise
         
@@ -232,6 +241,19 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
                 for domain in pushdomains:
                     domain.popState()
         
+        # If we reach here, all values for 'variable' have been tried and failed.
+        # Log backtrack due to exhaustion of values
+        self.logger.debug(f"Backtracking from variable {variable} after exhausting all values.")
+        self.backtrack_count += 1
+        if self.decision_history and self.decision_history[-1]['variable'] == variable:
+            self.decision_history[-1]['action'] = 'backtrack_exhausted_values'
+        else:
+            self.decision_history.append({
+                'variable': variable,
+                'assignments_at_decision': assignments.copy(),
+                'action': 'backtrack_exhausted_values'
+            })
+
         del assignments[variable]
         return solutions
     
@@ -401,9 +423,16 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
         
         # Add recent decision history for context
         if self.decision_history:
-            feedback_str += "\nRecent variable selection history:\n"
-            for i, decision in enumerate(self.decision_history[-3:]):  # Last 3 decisions
-                feedback_str += f"- Selected {decision['variable']} with domain {decision['domain']}\n"
+            feedback_str += "\nRecent decision history (last 5 actions):\n"
+            for i, decision in enumerate(self.decision_history[-5:]):  # Last 5 decisions/actions
+                action_info = f"Selected {decision.get('variable')}"
+                if 'ordered_values' in decision and decision['ordered_values']:
+                    action_info += f", ordered values: {decision['ordered_values'][:3]}..."
+                if 'action' in decision:
+                    action_info += f", result: {decision['action']}"
+                
+                assignments_at_decision = decision.get('assignments_at_decision', decision.get('assignments', {}))
+                feedback_str += f"- {action_info} (with assignments: {assignments_at_decision})\n"
         
         # Build the prompt, including problem instance information and feedback
         prompt = (
@@ -451,7 +480,7 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
         self.decision_history.append({
             'variable': None,  # Will be filled after selection
             'domain': domains,
-            'assignments': assignments.copy()
+            'assignments_at_decision': assignments.copy()
         })
         
         def parse_and_validate(content):
@@ -469,7 +498,9 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
             
             # Update decision history with the selected variable
             if self.decision_history:
-                self.decision_history[-1]['variable'] = var_name
+                if 'variable' in self.decision_history[-1] and self.decision_history[-1]['variable'] is None:
+                    self.decision_history[-1]['variable'] = var_name
+                    self.decision_history[-1]['action'] = 'selected_variable'
             
             return var_name
             
@@ -538,11 +569,30 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
         if self.best_objective_value is not None:
             feedback_str += f"\nCurrent best objective value: {self.best_objective_value}\n"
         
-        # Add information about previous assignments of this variable
+        # Add information about previous assignments of this variable and backtracking
         var_history = [d for d in self.decision_history if d.get('variable') == variable]
         if var_history:
-            feedback_str += f"\nThis variable has been assigned before in {len(var_history)} previous search branches.\n"
-        
+            feedback_str += f"\nHistory for variable {variable}:\n"
+            for i, decision in enumerate(var_history[-3:]):  # Last 3 relevant decisions
+                action_desc = "assigned"
+                if 'action' in decision:
+                    action_desc = decision['action']
+                feedback_str += f"  - Previously {action_desc}"
+                if 'ordered_values' in decision:
+                    feedback_str += f", tried values: {decision['ordered_values']}"
+                assignments_at_decision = decision.get('assignments_at_decision', decision.get('assignments', {}))
+                feedback_str += f" (with assignments: {assignments_at_decision})\n"
+
+        # Add general recent backtracking information
+        recent_backtracks = [d for d in self.decision_history if 'backtrack' in d.get('action', '')]
+        if recent_backtracks:
+            feedback_str += "\nRecent backtracking events (last 3):\n"
+            for i, backtrack_event in enumerate(recent_backtracks[-3:]):
+                prev_assignments = backtrack_event.get('assignments_at_decision', backtrack_event.get('assignments', {}))
+                feedback_str += (f"  - Backtracked from variable {backtrack_event.get('variable')} "
+                                 f"due to {backtrack_event.get('action')} "
+                                 f"(assignments at that point: {prev_assignments})\n")
+
         # Analyze which values might lead to constraint violations
         if self.constraint_descriptions:
             feedback_str += f"\nValue choice analysis for {variable}:\n"
@@ -592,8 +642,9 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
         self.decision_history.append({
             'variable': variable,
             'domain': values,
-            'assignments': assignments.copy(),
-            'ordered_values': None  # Will be filled after ordering
+            'assignments_at_decision': assignments.copy(),
+            'ordered_values': None,  # Will be filled after ordering
+            'action': 'pending_value_order'  # Placeholder action
         })
         
         def parse_and_validate(content):
@@ -625,7 +676,16 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
             
             # Update decision history with the ordered values
             if self.decision_history:
-                self.decision_history[-1]['ordered_values'] = ordered_values
+                if (self.decision_history[-1]['variable'] == variable and
+                    self.decision_history[-1]['action'] == 'pending_value_order'):
+                    self.decision_history[-1]['ordered_values'] = ordered_values
+                    self.decision_history[-1]['action'] = 'ordered_values'
+                else:
+                    for entry in reversed(self.decision_history):
+                        if entry['variable'] == variable and entry['action'] == 'pending_value_order':
+                            entry['ordered_values'] = ordered_values
+                            entry['action'] = 'ordered_values'
+                            break
             
             return ordered_values
             
@@ -703,7 +763,6 @@ class AdvancedHeuristicSolver(RecursiveBacktrackingSolver):
                 current_prompt = user_prompt
                 if error_msg and attempts > 0:
                     current_prompt = (
-                        
                         f"Your previous response caused this error:\n{error_msg}\n"
                         "Please try again with a corrected answer." +
                         f"{user_prompt}\n\n"
