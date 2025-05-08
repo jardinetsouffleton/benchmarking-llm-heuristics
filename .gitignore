@@ -13,3 +13,5 @@ __pycache__/
 *.hypothesis/
 *.tox/
 *.coverage.*
+results/*
+experiments/*
